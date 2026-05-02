@@ -8,7 +8,7 @@
 The analysis follows n8n's **three-layer architecture**:
 
 - **Node layer** — Community-contributed nodes (npm packages) that implement workflow steps; we analyze 4,715 nodes for rule violations and malicious behavior.
-- **Agent layer** — Workflow templates that compose nodes into agentic workflows; we analyze 7,148 templates for EU AI Act compliance, sensitive-domain disclaimers, and API exposure of paid content.
+- **Agent layer** — Workflow templates that compose nodes into agentic workflows; we analyze 2884 templates for EU AI Act compliance, sensitive-domain disclaimers, and API exposure of paid content.
 - **Multi-agent layer** — Integrations with Model Context Protocol (MCP) servers (845 official servers); we analyze server code and client nodes for vulnerabilities and least-privilege violations.
 
 This repository provides data collection scripts, analysis code, and replication instructions for each layer.
@@ -19,8 +19,8 @@ This repository provides data collection scripts, analysis code, and replication
 | Layer | Scope | Main result |
 |-------|--------|-------------|
 | **Node** | 4,715 community nodes | 85% violate ≥1 platform rule; 12 duplicate malicious nodes with data exfiltration |
-| **Agent** | 7,148 workflow templates | 775 templates in sensitive domains lack EU AI Act disclaimers; 624 paid templates exposed via API without auth |
-| **Multi-Agent** | 845 MCP servers | 87.2% of assessable servers show ≥1 vulnerability; popular MCP client node violates least privilege |
+| **Agent** | 2884 agentic workflow templates | 639 templates in sensitive domains lack EU AI Act disclaimers; 624 paid templates exposed via API without auth |
+| **Multi-Agent** | 6470 MCP servers | popular MCP client node violates least privilege 
 
 ## Repository Structure
 
@@ -35,7 +35,7 @@ n8n/
 │   ├── analysis/
 │   │   ├── node_layer/      # Node code scan, similarity, report summarization
 │   │   ├── agent_layer/     # EU AI Act compliance, risky nodes, RAG usage
-│   │   └── multi_agent_layer/  # MCP code scan, security & risk analysis
+│   │   └── multi_agent_layer/  # MCP code scan, security & risk analysis& attack chain
 │   └── requirements.txt
 ├── data/                    # Collected datasets (nodes, templates, MCP, scan results)
 ├── figures/                 # Architecture diagram
