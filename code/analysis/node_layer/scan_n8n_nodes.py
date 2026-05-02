@@ -4,9 +4,11 @@ import io
 import os
 import re
 import json
+import argparse
 import tarfile
 import zipfile
 import shutil
+import sys
 import tempfile
 import gc
 from pathlib import Path
@@ -15,15 +17,309 @@ from datetime import datetime
 
 INPUT_CSV    = "../data/node_fetch_result/n8n_nodes_final_2025-11-15_11-36-26.csv"
 OUTPUT_FILE  = "../data/scan_result/scan_report.json"
+# When using --packages-txt and no --output, default report path:
+DEFAULT_PACKAGES_TXT_OUTPUT = "../data/scan_result/scan_report_community_packages.json"
 KEEP_WORKDIR = False
 OFFICIAL_N8N_REPO = "https://github.com/n8n-io/n8n"
-USER_AGENT   = "n8n-node-audit/4.0-npm-only-filtered"
+USER_AGENT   = "n8n-node-audit/5.0-n9-npm"
 
 try:
     import requests
 except Exception:
     print("Please install: pip install requests pandas")
     raise
+
+
+# ---------------------------------------------------------------------------
+# Paper taxonomy (N1–N9) + Table 3 node-layer helpers (inlined).
+# ---------------------------------------------------------------------------
+PAPER_N_ORDER: Tuple[str, ...] = tuple(f"N{i}" for i in range(1, 10))
+
+PAPER_N_RULE_NAME_EN: Dict[str, str] = {
+    "N1": "Dynamic Code Execution",
+    "N2": "Outbound Data Exfiltration",
+    "N3": "File-System Access Risk",
+    "N4": "SSRF / Internal Reachability",
+    "N5": "Credential Handling Misuse",
+    "N6": "Dependency Supply-Chain Risk",
+    "N7": "Approved third-party node Non-Compliance",
+    "N8": "UI/Output Injection Surface",
+    "N9": "Prompt Injection",
+}
+
+PAPER_N_CWES: Dict[str, Tuple[str, ...]] = {
+    "N1": ("CWE-78", "CWE-94"),
+    "N2": ("CWE-201", "CWE-359"),
+    "N3": ("CWE-73", "CWE-22"),
+    "N4": ("CWE-918",),
+    "N5": ("CWE-798", "CWE-532", "CWE-256"),
+    "N6": ("CWE-1104", "CWE-1357"),
+    "N7": (),
+    "N8": ("CWE-79",),
+    "N9": ("CWE-74",),
+}
+
+PAPER_N_DETECTION_LOGIC: Dict[str, str] = {
+    "N1": "Usage of eval, vm, new Function, or child_process.",
+    "N2": "Outbound HTTP with data adjacent to files or secrets.",
+    "N3": "fs.* on tainted or user-influenced paths.",
+    "N4": "Attacker-influenced URLs reaching internal or non-public addresses.",
+    "N5": "Env vars or hardcoded secrets near network or file sinks.",
+    "N6": "Install scripts, risky package.json dependencies, weak provenance.",
+    "N7": "I/O, dependencies, provenance, licensing, documentation vs platform policy.",
+    "N8": "HTML/DOM write sinks (e.g. innerHTML, document.write).",
+    "N9": "User input passed into LLM or tool prompts.",
+}
+
+GRANULAR_TO_PAPER_N: Dict[str, str] = {
+    "COMMAND_EXEC": "N1",
+    "VM_DYNAMIC": "N1",
+    "EVAL_DYNAMIC": "N1",
+    "DYNAMIC_REQUIRE": "N1",
+    "DYNAMIC_IMPORT": "N1",
+    "DYNAMIC_REGEX": "N1",
+    "DESERIALIZE": "N1",
+    "REMOTE_SHELL_CALL": "N1",
+    "EXT_HTTP_CALL": "N2",
+    "EXT_HTTP_IMPORT": "N2",
+    "EXT_HTTP_DEP": "N7",
+    "RAW_NET": "N2",
+    "HTTP_PROTO": "N2",
+    "SSRF_HOST": "N4",
+    "PROXY_TUNNEL": "N2",
+    "EXFIL_SDK_CALL": "N2",
+    "BROWSER_STEALTH": "N2",
+    "FS_CHILD_IMPORT": "N3",
+    "PROCESS_ENV": "N5",
+    "LOG_SENSITIVE": "N5",
+    "DATAURL_JSON": "N5",
+    "BINARY_PREPARE": "N5",
+    "BINARY_PREPARE_WEAK": "N5",
+    "CRED_DECL": "N5",
+    "INPUT_SECRET_UNMASKED": "N5",
+    "DELETE_RET_BOOL": "N7",
+    "OFFICIAL_REPO_IMPERSONATION": "N6",
+    "EXT_SUS_DEP": "N7",
+    "EXT_SUS_IMPORT": "N7",
+    "PKG_JSON_INVALID": "N7",
+    "PKG_JSON_MISSING": "N7",
+    "LICENSE": "N7",
+    "I18N_NON_EN": "N7",
+    "VERSION_MISMATCH": "N7",
+    "HTML_UNSANITIZED": "N8",
+    "PROMPT_INJECTION_CANDIDATE": "N9",
+}
+
+BASE_TIER_BY_PAPER_N: Dict[str, str] = {
+    "N1": "Sv",
+    "N2": "Sv",
+    "N3": "Md",
+    "N4": "Md",
+    "N5": "Sv",
+    "N6": "Md",
+    "N7": "Md",
+    "N8": "Md",
+    "N9": "Md",
+}
+
+# Table 6 policy themes (third-party packages): prohibited deps, version misalignment,
+# duplicate-node API pattern, package.json verification, license, non-English docs.
+# Env / file-process access use other paper Ns here (e.g. PROCESS_ENV -> N5, FS_CHILD_IMPORT -> N3).
+N7_PLATFORM_POLICY_BY_RULE: Dict[str, str] = {
+    "DELETE_RET_BOOL": "duplicate_nodes",
+    "EXT_HTTP_DEP": "prohibited_external_dependencies",
+    "EXT_SUS_DEP": "prohibited_external_dependencies",
+    "EXT_SUS_IMPORT": "prohibited_external_dependencies",
+    "VERSION_MISMATCH": "version_misalignment",
+    "PKG_JSON_INVALID": "package_source_verification_failure",
+    "PKG_JSON_MISSING": "package_source_verification_failure",
+    "LICENSE": "non_mit_license_compliance",
+    "I18N_NON_EN": "non_english_documentation",
+}
+
+
+def resolve_paper_n_for_rule(rule: Optional[str]) -> str:
+    if not rule:
+        return "N7"
+    return GRANULAR_TO_PAPER_N.get(rule, "N7")
+
+
+def paper_n_from_finding(entry: Dict[str, Any], rule: Optional[str]) -> str:
+    pn = entry.get("paper_n")
+    if isinstance(pn, str) and pn.startswith("N") and pn[1:].isdigit():
+        return pn
+    return resolve_paper_n_for_rule(rule)
+
+
+def attach_paper_n_to_finding(entry: Dict[str, Any], rule: str) -> None:
+    pn = resolve_paper_n_for_rule(rule)
+    entry["paper_n"] = pn
+    if pn == "N7":
+        pp = N7_PLATFORM_POLICY_BY_RULE.get(rule)
+        if pp:
+            entry["n7_platform_policy"] = pp
+
+
+def _slug_family(name: str) -> str:
+    return (
+        name.lower()
+        .replace(" / ", "_")
+        .replace("/", "_")
+        .replace(" ", "_")
+    )
+
+
+def attach_node_layer_table3_to_finding(entry: Dict[str, Any], rule: str) -> None:
+    pn = paper_n_from_finding(entry, rule)
+    name = PAPER_N_RULE_NAME_EN.get(pn, "")
+    tier = BASE_TIER_BY_PAPER_N.get(pn, "Md")
+    cwes = list(PAPER_N_CWES.get(pn, ()))
+    logic = PAPER_N_DETECTION_LOGIC.get(pn, "")
+    entry["node_layer_rule_id"] = pn
+    entry["node_layer_rule_name"] = name
+    entry["node_layer_severity_tier"] = tier
+    entry["node_layer_cwes"] = cwes
+    entry["node_layer_detection_logic"] = logic
+    entry["n9_rule_id"] = pn
+    entry["n9_family"] = _slug_family(name) if name else None
+
+
+def node_layer_rule_catalog() -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for nid in PAPER_N_ORDER:
+        out.append(
+            {
+                "id": nid,
+                "rule": PAPER_N_RULE_NAME_EN.get(nid, ""),
+                "severity_tier": BASE_TIER_BY_PAPER_N.get(nid, "Md"),
+                "cwes": list(PAPER_N_CWES.get(nid, ())),
+                "detection_logic": PAPER_N_DETECTION_LOGIC.get(nid, ""),
+            }
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# §4 labeling (tier / confidence / evidence); self-contained in this file.
+# Optional paper_m on a finding adds tier_m when present (Paper M1–M9 table).
+# ---------------------------------------------------------------------------
+TE_STRUCT_NOT_COMPUTED_NOTE = (
+    "Structural exposure TE^struct was not computed in this pipeline run; field te_struct is null."
+)
+
+BASE_TIER_BY_PAPER_M: Dict[str, str] = {
+    "M1": "Sv",
+    "M2": "Sv",
+    "M3": "Md",
+    "M4": "Md",
+    "M5": "Md",
+    "M6": "Md",
+    "M7": "Md",
+    "M8": "Sv",
+    "M9": "Sv",
+}
+
+
+def _label_non_empty(v: Any) -> bool:
+    if v is None:
+        return False
+    if isinstance(v, str):
+        return len(v.strip()) > 0
+    if isinstance(v, (list, dict)):
+        return len(v) > 0
+    return True
+
+
+def tier_from_paper_m(paper_m: str) -> Optional[str]:
+    return BASE_TIER_BY_PAPER_M.get(paper_m)
+
+
+def static_evidence_score(finding: Dict[str, Any]) -> int:
+    """Count static evidential signals (0–6): file, line_*, match_lines, matched_text, code_snippet, message, rule."""
+    score = 0
+    if _label_non_empty(finding.get("file")):
+        score += 1
+    if finding.get("line_start") is not None or finding.get("line_end") is not None:
+        score += 1
+    if _label_non_empty(finding.get("match_lines")):
+        score += 1
+    if _label_non_empty(finding.get("matched_text")):
+        score += 1
+    if _label_non_empty(finding.get("code_snippet")):
+        score += 1
+    if _label_non_empty(finding.get("message")):
+        score += 1
+    if _label_non_empty(finding.get("rule")):
+        score += 1
+    return min(score, 6)
+
+
+def confidence_from_evidence(score: int) -> int:
+    """1 = Uncertain, 2 = Probable (score >= 4 → 2, else 1)."""
+    return 2 if score >= 4 else 1
+
+
+def tier_from_paper_n(paper_n: str) -> str:
+    return BASE_TIER_BY_PAPER_N.get(paper_n, "Md")
+
+
+def label_finding(
+    finding: Dict[str, Any],
+    *,
+    rule: Optional[str] = None,
+    npm_package: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Enriched labels for one finding. Primary severity tier follows paper_n (npm scanner axis).
+    Optional paper_m on the finding adds tier_m when present.
+    """
+    r = rule if rule is not None else finding.get("rule")
+    paper_n = paper_n_from_finding(finding, str(r) if r else None)
+    tier_n = tier_from_paper_n(paper_n)
+
+    pm_raw = finding.get("paper_m")
+    paper_m: Optional[str] = None
+    tier_m: Optional[str] = None
+    if isinstance(pm_raw, str) and pm_raw.startswith("M") and pm_raw[1:].isdigit():
+        paper_m = pm_raw
+        tier_m = tier_from_paper_m(paper_m)
+
+    ev = static_evidence_score(finding)
+    conf = confidence_from_evidence(ev)
+
+    te_struct = finding.get("te_struct")
+    if te_struct is None and "te_struct" not in finding:
+        te_struct = None
+
+    reasoning_parts = [
+        f"paper_n={paper_n}→tier {tier_n}",
+    ]
+    if paper_m:
+        reasoning_parts.append(f"paper_m={paper_m}→tier_m {tier_m}")
+    reasoning_parts.append(f"confidence={conf} (evidence_score={ev}/6)")
+    if te_struct is None:
+        reasoning_parts.append("te_struct=null")
+
+    out: Dict[str, Any] = {
+        "npm_package": npm_package,
+        "rule": r,
+        "paper_n": paper_n,
+        "tier": tier_n,
+        "tier_n": tier_n,
+        "scanner_severity": finding.get("severity"),
+        "confidence": conf,
+        "confidence_label": "Probable" if conf == 2 else "Uncertain",
+        "evidence_score": ev,
+        "te_struct": te_struct,
+    }
+    if paper_m:
+        out["paper_m"] = paper_m
+        out["tier_m"] = tier_m
+    if te_struct is None:
+        out["te_struct_note"] = TE_STRUCT_NOT_COMPUTED_NOTE
+    out["reasoning"] = "; ".join(reasoning_parts)
+    return out
+
 
 def now_ts() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -84,6 +380,8 @@ RULE_CATEGORY = {
     "EXT_SUS_IMPORT": "SUSPICIOUS_IMPORT",
     "BROWSER_STEALTH": "SUSPICIOUS_IMPORT",
     "ENV_FS": "DATA_PRIVACY",
+    "PROCESS_ENV": "DATA_PRIVACY",
+    "FS_CHILD_IMPORT": "DATA_PRIVACY",
     "LOG_SENSITIVE": "DATA_PRIVACY",
     "DATAURL_JSON": "DATA_PRIVACY",
     "BINARY_PREPARE": "DATA_PRIVACY",
@@ -92,14 +390,36 @@ RULE_CATEGORY = {
     "CRED_DECL": "DATA_PRIVACY",
     "INPUT_SECRET_UNMASKED": "DATA_PRIVACY",
     "HTML_UNSANITIZED": "HTML_XSS",
-    "NODE_ENGINE": "CONFIG",
+    "PROMPT_INJECTION_CANDIDATE": "PROMPT_INJECTION",
     "LICENSE": "CONFIG",
     "PKG_JSON_INVALID": "CONFIG",
     "PKG_JSON_MISSING": "CONFIG",
     "I18N_NON_EN": "CONFIG",
 
     "OFFICIAL_REPO_IMPERSONATION": "SUPPLYCHAIN",
+    "VERSION_MISMATCH": "SUPPLYCHAIN",
 }
+
+
+def dedupe_findings(findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen: set = set()
+    out: List[Dict[str, Any]] = []
+    for e in findings:
+        key = (
+            e.get("rule"),
+            e.get("file"),
+            e.get("message"),
+            e.get("npm_name"),
+            e.get("line_start"),
+            e.get("line_end"),
+            tuple(e.get("match_lines") or ()),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(e)
+    return out
+
 
 PROCESS_ENV_RE = re.compile(r"\bprocess\.env\b")
 FS_CHILD_IMPORT_RE = re.compile(
@@ -125,7 +445,6 @@ RAW_NET_IMPORT_RE = re.compile(
     re.I | re.M,
 )
 
-ENGINES_NODE_RE = re.compile(r"^\s*>=\s*20")
 MIT_LICENSE_RE = re.compile(r"mit", re.I)
 
 IGNORE_DIRS = {
@@ -286,6 +605,57 @@ REMOTE_SHELL_HINT_RE = re.compile(
     r"\b(node-pty|pty\.js|ssh2|spawn\(\s*['\"]sh|spawn\(\s*['\"]bash)",
     re.I,
 )
+
+# N9: LLM / chat API surface + n8n getNodeParameter keys that typically feed model text (static candidate).
+LLM_API_SURFACE_RE = re.compile(
+    r"(?is)\b(?:"
+    r"openai|@openai/|anthropic|@anthropic-ai/|ollama|@langchain|langchain|"
+    r"ChatOpenAI|ChatAnthropic|AzureOpenAI|GoogleGenerativeAI|GenerativeModel|"
+    r"createChatCompletion|chat\.completions|\.messages\.|client\.chat|bedrock|"
+    r"cohere|mistral|together\.ai|replicate|huggingface|@google/generative-ai|"
+    r"google\.generativeai|VertexAI|ai\.google"
+    r")\b",
+)
+GET_NODE_PARAMETER_KEY_RE = re.compile(
+    r"getNodeParameter\s*\(\s*['\"](?P<key>[^'\"]+)['\"]",
+    re.M,
+)
+# Keys that are usually not model-bound text (reduce obvious false positives)
+_PROMPT_KEY_DENYLIST = frozenset(
+    {
+        "operation",
+        "resource",
+        "model",
+        "models",
+        "version",
+        "baseUrl",
+        "url",
+        "endpoint",
+        "authentication",
+    }
+)
+
+
+def _node_parameter_key_suggests_llm_prompt(key: str) -> bool:
+    k = key.strip().lower()
+    if not k or k in _PROMPT_KEY_DENYLIST:
+        return False
+    needles = (
+        "prompt",
+        "message",
+        "messages",
+        "system",
+        "instruction",
+        "chat",
+        "query",
+        "completion",
+        "user",
+        "assistant",
+        "input",
+        "context",
+        "text",
+    )
+    return any(n in k for n in needles)
 
 
 def get_comment_spans_js(text: str) -> List[Tuple[int, int]]:
@@ -484,6 +854,8 @@ def add_finding(
         )
     elif matched_text is not None:
         entry["matched_text"] = matched_text
+    attach_paper_n_to_finding(entry, rule)
+    attach_node_layer_table3_to_finding(entry, rule)
     findings.append(entry)
 
 
@@ -655,6 +1027,32 @@ def load_rows_from_csv(path: str) -> List[Dict[str, str]]:
     return rows
 
 
+def _script_dir() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def resolve_scan_path(p: str) -> Path:
+    path = Path(p)
+    if path.is_absolute():
+        return path
+    return (_script_dir() / path).resolve()
+
+
+def load_rows_from_package_txt(path: str) -> List[Dict[str, str]]:
+    p = Path(path)
+    if not p.is_file():
+        raise FileNotFoundError(f"package list not found: {path}")
+    rows: List[Dict[str, str]] = []
+    for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+        name = line.strip()
+        if not name or name.startswith("#"):
+            continue
+        rows.append({"name": name, "repository_url": ""})
+    if not rows:
+        raise ValueError(f"no package names in {path}")
+    return rows
+
+
 def should_ignore_as_ui_text(text: str, pos: int, rel: str) -> bool:
     window_left = max(0, pos - 300)
     window_right = min(len(text), pos + 300)
@@ -716,16 +1114,6 @@ def scan_tree(root_dir: str, npm_name_for_pkg: Optional[str]) -> Dict[str, Any]:
         )
 
     if pkg_json:
-        engines = (pkg_json.get("engines") or {}).get("node")
-        if not engines or not ENGINES_NODE_RE.search(str(engines)):
-            add_finding(
-                findings,
-                "error",
-                "NODE_ENGINE",
-                "package.json",
-                "package.json engines.node should be '>=20'",
-                pkg=npm_name_for_pkg,
-            )
         license_field = pkg_json.get("license") or pkg_json.get("licenses")
         if (not license_field) or (
             isinstance(license_field, str)
@@ -855,7 +1243,7 @@ def scan_tree(root_dir: str, npm_name_for_pkg: Optional[str]) -> Dict[str, Any]:
             add_finding(
                 findings,
                 "error",
-                "ENV_FS",
+                "PROCESS_ENV",
                 rel,
                 "process.env usage",
                 pkg=npm_name_for_pkg,
@@ -866,7 +1254,7 @@ def scan_tree(root_dir: str, npm_name_for_pkg: Optional[str]) -> Dict[str, Any]:
             add_finding(
                 findings,
                 "error",
-                "ENV_FS",
+                "FS_CHILD_IMPORT",
                 rel,
                 "fs/child_process import",
                 pkg=npm_name_for_pkg,
@@ -1320,6 +1708,25 @@ def scan_tree(root_dir: str, npm_name_for_pkg: Optional[str]) -> Dict[str, Any]:
                 span=h.span(),
             )
 
+        # N9: prompt-injection surface — LLM/chat API use + getNodeParameter keys that plausibly feed user/model text
+        if list(finditer_nocomment(LLM_API_SURFACE_RE, txt, comment_spans)):
+            for m in finditer_nocomment(GET_NODE_PARAMETER_KEY_RE, txt, comment_spans):
+                key = m.group("key")
+                if not _node_parameter_key_suggests_llm_prompt(key):
+                    continue
+                add_finding(
+                    findings,
+                    "warn",
+                    "PROMPT_INJECTION_CANDIDATE",
+                    rel,
+                    "LLM/chat API with getNodeParameter for prompt-like key (static N9: user-controlled text may reach the model).",
+                    pkg=npm_name_for_pkg,
+                    text=txt,
+                    span=m.span(),
+                    matched_text=key,
+                )
+
+    findings = dedupe_findings(findings)
     return {
         "findings": findings,
         "meta": {
@@ -1377,10 +1784,58 @@ def download_npm_tarball(tarball_url: str) -> bytes:
     return r.content
 
 def main():
+    ap = argparse.ArgumentParser(
+        description="Scan n8n community node packages from npm (node_layer scanner).",
+    )
+    ap.add_argument(
+        "--packages-txt",
+        type=str,
+        default=None,
+        help="Text file: one npm package per line (empty lines and # comments skipped).",
+    )
+    ap.add_argument(
+        "--input-csv",
+        type=str,
+        default=None,
+        help="CSV with name, repository_url (default: built-in INPUT_CSV).",
+    )
+    ap.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Output JSON path (default depends on --packages-txt vs CSV mode).",
+    )
+    args = ap.parse_args()
+
+    if args.packages_txt and args.input_csv:
+        ap.error("Use only one of --packages-txt or --input-csv.")
+
+    if args.packages_txt:
+        pt = resolve_scan_path(args.packages_txt)
+        rows = load_rows_from_package_txt(str(pt))
+        input_csv_for_header: Optional[str] = None
+        input_packages_txt_for_header = str(pt)
+        if args.output:
+            out = resolve_scan_path(args.output)
+        else:
+            out = resolve_scan_path(DEFAULT_PACKAGES_TXT_OUTPUT)
+    else:
+        csv_p = (
+            resolve_scan_path(args.input_csv)
+            if args.input_csv
+            else resolve_scan_path(INPUT_CSV)
+        )
+        rows = load_rows_from_csv(str(csv_p))
+        input_csv_for_header = str(csv_p)
+        input_packages_txt_for_header: Optional[str] = None
+        if args.output:
+            out = resolve_scan_path(args.output)
+        else:
+            out = resolve_scan_path(OUTPUT_FILE)
+
     work = Path(tempfile.mkdtemp(prefix="scan-npm-only-"))
     print(f"[+] workdir: {work}")
 
-    rows = load_rows_from_csv(INPUT_CSV)
     total_pkgs = len(rows)
     print(f"[i] total packages: {total_pkgs}")
 
@@ -1393,15 +1848,25 @@ def main():
         "repo_impersonation": 0,
     }
 
-    Path(OUTPUT_FILE).parent.mkdir(parents=True, exist_ok=True)
+    out.parent.mkdir(parents=True, exist_ok=True)
     first_item = True
+    _node_layer_catalog = node_layer_rule_catalog()
 
-    with Path(OUTPUT_FILE).open("w", encoding="utf-8") as fout:
+    with out.open("w", encoding="utf-8") as fout:
         # JSON header
         fout.write("{\n")
         fout.write(f'  "source": "npm_only",\n')
-        fout.write(f'  "input_csv": {json.dumps(INPUT_CSV, ensure_ascii=False)},\n')
-        fout.write(f'  "output": {json.dumps(OUTPUT_FILE, ensure_ascii=False)},\n')
+        fout.write('  "finding_taxonomy": "node_layer_table3",\n')
+        fout.write(
+            f'  "node_layer_rule_catalog": {json.dumps(_node_layer_catalog, ensure_ascii=False)},\n'
+        )
+        fout.write(
+            f'  "input_csv": {json.dumps(input_csv_for_header, ensure_ascii=False)},\n'
+        )
+        fout.write(
+            f'  "input_packages_txt": {json.dumps(input_packages_txt_for_header, ensure_ascii=False)},\n'
+        )
+        fout.write(f'  "output": {json.dumps(str(out), ensure_ascii=False)},\n')
         fout.write(f'  "generated_at": {json.dumps(now_ts())},\n')
         fout.write('  "packages": [\n')
 
@@ -1461,6 +1926,12 @@ def main():
                         "rule": "OFFICIAL_REPO_IMPERSONATION",
                         "message": f"repository_url points to official {OFFICIAL_N8N_REPO}",
                     }
+                    attach_paper_n_to_finding(
+                        fraud, "OFFICIAL_REPO_IMPERSONATION"
+                    )
+                    attach_node_layer_table3_to_finding(
+                        fraud, "OFFICIAL_REPO_IMPERSONATION"
+                    )
                     counters["repo_impersonation"] += 1
 
             item["github_repo"] = repo_info
@@ -1522,7 +1993,7 @@ def main():
         fout.write(json.dumps(counters, ensure_ascii=False, indent=2).replace("\n", "\n  "))
         fout.write("\n}\n")
 
-    print(f"[OK] report -> {OUTPUT_FILE}")
+    print(f"[OK] report -> {out}")
 
     if not KEEP_WORKDIR:
         shutil.rmtree(work, ignore_errors=True)
